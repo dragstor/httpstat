@@ -25,9 +25,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/http2"
-
 	"github.com/fatih/color"
+	"golang.org/x/net/http2"
 )
 
 type Report struct {
@@ -77,6 +76,7 @@ var (
 	// Command line flags.
 	httpMethod      string
 	postBody        string
+	repeat          int
 	followRedirects bool
 	onlyHeader      bool
 	insecure        bool
@@ -100,6 +100,7 @@ const maxRedirects = 10
 func init() {
 	flag.StringVar(&httpMethod, "X", "GET", "HTTP method to use")
 	flag.StringVar(&postBody, "d", "", "the body of a POST or PUT request; from file use @filename")
+	flag.IntVar(&repeat, "r", 0, "Repeat the same request N times on the same connection")
 	flag.BoolVar(&followRedirects, "L", false, "follow 30x redirects")
 	flag.BoolVar(&onlyHeader, "I", false, "don't read body of request")
 	flag.BoolVar(&insecure, "k", false, "allow insecure SSL connections")
@@ -163,8 +164,11 @@ func main() {
 	}
 
 	url := parseURL(args[0])
+	tr := newTransport(url)
 
-	visit(url)
+	for i := repeat + 1; i > 0; i-- {
+		visit(tr, url)
+	}
 }
 
 // readClientCert - helper function to read client certificate
@@ -243,9 +247,42 @@ func dialContext(network string) func(ctx context.Context, network, addr string)
 	}
 }
 
+func newTransport(url *url.URL) *http.Transport {
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	switch url.Scheme {
+	case "https":
+		host, _, err := net.SplitHostPort(url.Host)
+		if err != nil {
+			host = url.Host
+		}
+
+		tr.TLSClientConfig = &tls.Config{
+			ServerName:         host,
+			InsecureSkipVerify: insecure,
+			Certificates:       readClientCert(clientCertFile),
+		}
+
+		// Because we create a custom TLSClientConfig, we have to opt-in to HTTP/2.
+		// See https://github.com/golang/go/issues/14275
+		err = http2.ConfigureTransport(tr)
+		if err != nil {
+			log.Fatalf("failed to prepare transport for HTTP/2: %v", err)
+		}
+	}
+
+	return tr
+}
+
 // visit visits a url and times the interaction.
 // If the response is a 30x, visit follows the redirect.
-func visit(url *url.URL) {
+func visit(tr *http.Transport, url *url.URL) {
 	req := newRequest(httpMethod, url, postBody)
 
 	var tStart, tDNSStart, tConnectStart, tTLSStart, tConnected, tTTFB time.Time
@@ -291,42 +328,6 @@ func visit(url *url.URL) {
 		},
 	}
 	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
-
-	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
-	switch {
-	case fourOnly:
-		tr.DialContext = dialContext("tcp4")
-	case sixOnly:
-		tr.DialContext = dialContext("tcp6")
-	}
-
-	switch url.Scheme {
-	case "https":
-		host, _, err := net.SplitHostPort(req.Host)
-		if err != nil {
-			host = req.Host
-		}
-
-		tr.TLSClientConfig = &tls.Config{
-			ServerName:         host,
-			InsecureSkipVerify: insecure,
-			Certificates:       readClientCert(clientCertFile),
-		}
-
-		// Because we create a custom TLSClientConfig, we have to opt-in to HTTP/2.
-		// See https://github.com/golang/go/issues/14275
-		err = http2.ConfigureTransport(tr)
-		if err != nil {
-			log.Fatalf("failed to prepare transport for HTTP/2: %v", err)
-		}
-	}
 
 	client := &http.Client{
 		Transport: tr,
@@ -401,7 +402,7 @@ func visit(url *url.URL) {
 			log.Fatalf("maximum number of redirects (%d) followed", maxRedirects)
 		}
 
-		visit(loc)
+		visit(tr, loc)
 	}
 }
 
